@@ -204,6 +204,28 @@ class CuptiMonitor:
         self._outstanding_warned = False
         self._dropped_records = 0
 
+        # Opt-in PM sampling (true SM-active % / DRAM-throughput % counters): the monitor registers
+        # each requesting observer as a consumer of the current device's per-device PmSampler
+        # (only one PM session per device is possible), polls the ring on the flush cadence, and
+        # converts each frame's raw CUPTI-clock timestamps into the trace clock before delivery (the
+        # sampler is clock-agnostic; conversion lives here, where the clock base does). Each consumer
+        # brings its own metrics; the shared session samples their union. The session starts on the
+        # first consumer and disables after the last. self._pm_consumers maps an observer's sink to
+        # its (handle, wrapped-sink) so release can unregister it.
+        self._pm_consumers: dict[
+            Callable[[dict[str, Any]], None],
+            tuple[Any, Callable[[dict[str, Any]], None]],
+        ] = {}
+        self._pm_sampler: Any = None
+        # Monotonic time of the last PM poll, to rate-limit polling to the sampler's suggested
+        # cadence (see suggested_poll_interval_ns) rather than every flush. decode drains, so this is
+        # not about avoiding redundant work -- it drains before the ring overflows without a flood of
+        # tiny per-flush decodes.
+        self._pm_last_poll_s = 0.0
+        # Serializes PM add/poll/remove so a flush-thread poll never decodes the collector while the
+        # foreground is tearing it down (concurrent decode on one collector is unsafe).
+        self._pm_lock = threading.Lock()
+
     def register_callbacks(self) -> None:
         if self._callbacks_registered:
             return
@@ -298,6 +320,9 @@ class CuptiMonitor:
             if self._flush_thread.is_alive():
                 logger.warning("CUPTI monitor flush thread did not stop within 5s")
             self._flush_thread = None
+        # Flush thread is down (no concurrent poll): final tail-drain + disable the PM sessions
+        # while observers are still registered, so their last samples are delivered.
+        self._stop_pm_sampler()
         # Drain everything in flight (incl. CUPTI's async deliveries) before we tear
         # the decoder down, so the final window is complete. Then stop the native
         # decode worker while the subscriber is STILL valid -- it may still decode a
@@ -364,6 +389,7 @@ class CuptiMonitor:
             self._cupti.activity_flush_all()
             self._account_dropped_records(0, 0)
             self._drain_and_dispatch()
+            self._poll_pm_sampler()
             return
         added = self._begin_fence_kind()
         try:
@@ -392,6 +418,7 @@ class CuptiMonitor:
             # The fence guarantees everything up to the sync point is decoded; hand
             # the accumulated window to the observers now.
             self._drain_and_dispatch()
+            self._poll_pm_sampler()
 
     def _begin_fence_kind(self) -> bool:
         """Enable + make decodable the SYNCHRONIZATION sync-point kind for the
@@ -528,6 +555,81 @@ class CuptiMonitor:
             self.stop()
         else:
             self._apply_selection()
+
+    # --- PM sampling (opt-in GPU utilization counters) -----------------------
+
+    def request_pm_sampling(
+        self, sink: Callable[[dict[str, Any]], None], metrics: Iterable[str]
+    ) -> None:
+        """Register ``sink`` as a PM-sampling consumer wanting ``metrics`` on the current device.
+        The shared per-device session samples the union of all consumers' metrics; the first
+        consumer starts it (see pm_sampling env vars for interval/look-back). Frames arrive on the
+        flush thread with ``start_ns`` already converted into the trace clock. No-op if PM sampling
+        is unavailable, no metrics are given, or ``sink`` is already registered."""
+        from torch.profiler._cupti.pm_sampling import (
+            is_available as pm_is_available,
+            PmSampler,
+        )
+
+        metrics = list(metrics)
+        if not pm_is_available() or not metrics:
+            return
+        with self._pm_lock:
+            if sink in self._pm_consumers:
+                return
+
+            # Wrap the observer's sink to convert the sampler's raw CUPTI-clock timestamps into the
+            # trace clock before delivery (the observer buckets frames by trace-time start_ns).
+            def wrapped(frame: dict[str, Any], _sink=sink) -> None:
+                frame = dict(frame)
+                frame["start_ns"] = self.convert_time_array(frame["start_ns"])
+                _sink(frame)
+
+            sampler = PmSampler()  # per-device singleton for the current device
+            try:
+                handle = sampler.add_consumer(metrics, wrapped)
+            except Exception as e:
+                logger.warning("PM sampling could not register consumer: %s", e)
+                return
+            self._pm_sampler = sampler
+            self._pm_last_poll_s = 0.0  # poll promptly after a (re)start
+            self._pm_consumers[sink] = (handle, wrapped)
+
+    def release_pm_sampling(self, sink: Callable[[dict[str, Any]], None]) -> None:
+        """Unregister a PM-sampling consumer; the session disables once the last one leaves.
+        Idempotent. Removing a consumer drains the tail to it first, so its final samples land."""
+        with self._pm_lock:
+            entry = self._pm_consumers.pop(sink, None)
+            sampler = self._pm_sampler
+            if entry is not None and sampler is not None:
+                sampler.remove_consumer(entry[0])
+            if not self._pm_consumers:
+                self._pm_sampler = None
+
+    def _poll_pm_sampler(self) -> None:
+        """Decode the ring without stopping, rate-limited to the sampler's suggested cadence (see
+        suggested_poll_interval_ns): decode drains, so this drains before the ring overflows without a
+        flood of tiny per-flush decodes. The final drain at release/stop catches the tail."""
+        with self._pm_lock:
+            sampler = self._pm_sampler
+            if sampler is None:
+                return
+            now = time.monotonic()
+            if (now - self._pm_last_poll_s) * 1e9 < sampler.suggested_poll_interval_ns:
+                return
+            self._pm_last_poll_s = now
+            sampler.poll()
+
+    def _stop_pm_sampler(self) -> None:
+        """Unregister the monitor's PM consumers (final tail-drain + disable when the last leaves).
+        Called at monitor stop in case observers have not released yet."""
+        with self._pm_lock:
+            sampler, self._pm_sampler = self._pm_sampler, None
+            entries = list(self._pm_consumers.values())
+            self._pm_consumers.clear()
+            if sampler is not None:
+                for handle, _ in entries:
+                    sampler.remove_consumer(handle)
 
     def _normalize_activities(
         self, activities: ActivitiesSpec
