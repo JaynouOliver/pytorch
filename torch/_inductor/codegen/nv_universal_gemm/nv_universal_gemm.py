@@ -2,8 +2,8 @@
 """
 NVIDIA Universal GEMM (NVGEMM) backend for PyTorch Inductor.
 
-This module provides integration with the cutlass_api library to enable
-high-performance GEMM kernels for NVIDIA GPUs.
+This module integrates with the CUTLASS operator API (`cutlass.operators` or
+legacy `cutlass_api`) to enable high-performance GEMM kernels for NVIDIA GPUs.
 """
 
 import itertools
@@ -62,7 +62,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         kernel_name: str,
         input_tensor_meta: TensorMeta | list[TensorMeta],
         output_tensor_meta: TensorMeta | list[TensorMeta],
-        kernel,  # cutlass_api.Kernel object
+        kernel,  # `cutlass.operators` or legacy `cutlass_api` kernel object
         accumulator_type: torch.dtype,
         variant: GemmVariant,
         workspace_size: int = 0,
@@ -181,7 +181,8 @@ class NVUniversalGemmCaller(ChoiceCaller):
     """
     ChoiceCaller for NVIDIA Universal GEMM kernels.
 
-    Wraps a cutlass_api kernel and integrates with Inductor's autotuning.
+    Wraps a `cutlass.operators` or legacy `cutlass_api` kernel and integrates
+    with Inductor's autotuning.
     """
 
     index_counter = itertools.count()
@@ -191,7 +192,7 @@ class NVUniversalGemmCaller(ChoiceCaller):
         name: str,
         input_nodes: list[Buffer],
         layout: Layout,
-        kernel,  # cutlass_api.Kernel object
+        kernel,  # `cutlass.operators` or legacy `cutlass_api` kernel object
         accumulator_type: torch.dtype,
         variant: GemmVariant,
         workspace_size: int = 0,
@@ -372,7 +373,8 @@ def _create_dummy_tensor_from_layout(
     Create a FakeTensor from a Layout for kernel filtering.
 
     Uses Layout.get_example() which creates FakeTensors within V.fake_mode,
-    avoiding real CUDA memory allocation. cutlass_api only needs shape/stride/dtype
+    avoiding real CUDA memory allocation. The CUTLASS operator API
+    (`cutlass.operators` or legacy `cutlass_api`) only needs shape/stride/dtype
     metadata for its supports() checks.
     """
     try:
@@ -394,12 +396,14 @@ _TILE_RE = re.compile(r"tile(\d+)x\d+x\d+")
 def _include_efc_kernels_only(metadata) -> bool:
     """Filter to include only EFC (Epilogue Fusion Compatible) kernels.
 
-    Excludes tile_M=64 EFC kernels: cutlass_api has a broadcast bug in the
+    Excludes tile_M=64 EFC kernels: the CUTLASS operator API
+    (`cutlass.operators` or legacy `cutlass_api`) has a broadcast bug in the
     epilogue thread operation for aux-tensor inputs with tile_M=64, and we
     don't yet know at autotune time whether fusion will consume aux tensors.
     Non-EFC kernels still cover tile_M=64, so plain GEMM autotune is unaffected.
 
-    Strictly requires the kernel name to encode tile dims; if cutlass_api ever
+    Strictly requires the kernel name to encode tile dims; if `cutlass.operators`
+    or legacy `cutlass_api` ever
     changes the naming scheme, this raises rather than silently letting the
     broken tile_M=64 kernels through.
     """
@@ -456,7 +460,8 @@ def _add_nv_gemm_choices_impl(
         partition_compatible_kernels,
     )
 
-    # Create dummy tensors for cutlass_api's supports() checks.
+    # Create dummy tensors for `cutlass.operators` or legacy `cutlass_api`
+    # supports() checks.
     # Pass node dtype to handle FP4 ReinterpretView (uint8 storage viewed as float4_e2m1fn_x2).
     dummy_tensors = [
         _create_dummy_tensor_from_layout(
@@ -512,7 +517,8 @@ def _add_nv_gemm_choices_impl(
             return 1  # efc bucket (with tile_M >= 128)
         if _exclude_efc_kernels(metadata):
             return 0  # non-efc bucket
-        # NOTE: tile_M < 128 EFC kernels are dropped due to a cutlass_api
+        # NOTE: tile_M < 128 EFC kernels are dropped due to a
+        # `cutlass.operators` or legacy `cutlass_api` broadcast bug.
         # broadcast bug. Tracking: https://github.com/pytorch/pytorch/issues/181901
         return -1
 
@@ -568,7 +574,8 @@ def _add_nv_gemm_choices_impl(
             choices.append(caller)
             num_added += 1
         except Exception:
-            # Broad: caller construction touches cutlass_api / fake-mode tensors
+            # Broad: caller construction touches `cutlass.operators` or legacy
+            # `cutlass_api` / fake-mode tensors
             # which can raise types other than RuntimeError/ValueError. A single
             # bad choice should never abort the rest of autotune choice population.
             log.debug("Failed to create %s choice", variant.op_name, exc_info=True)
@@ -588,7 +595,10 @@ def add_nv_universal_gemm_choices(
     Thin wrapper around _add_nv_gemm_choices_impl for regular GEMM.
     """
     if not ensure_nv_universal_gemm_available():
-        log.debug("cutlass_api not available, skipping NVIDIA Universal GEMM choices")
+        log.debug(
+            "CUTLASS operator API (`cutlass.operators` or legacy `cutlass_api`) "
+            "not available, skipping NVIDIA Universal GEMM choices"
+        )
         return
 
     _add_nv_gemm_choices_impl(
@@ -620,7 +630,8 @@ def add_nv_universal_grouped_gemm_choices(
     """
     if not ensure_nv_universal_gemm_available():
         log.debug(
-            "cutlass_api not available, skipping NVIDIA Universal Grouped GEMM choices"
+            "CUTLASS operator API (`cutlass.operators` or legacy `cutlass_api`) "
+            "not available, skipping NVIDIA Universal Grouped GEMM choices"
         )
         return
 

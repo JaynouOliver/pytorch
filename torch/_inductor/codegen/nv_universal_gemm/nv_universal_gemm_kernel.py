@@ -2,7 +2,8 @@
 """
 NVIDIA Universal GEMM kernel code generation.
 
-This module generates Python code that calls cutlass_api to execute GEMM operations.
+This module generates Python code that calls `cutlass.operators` or legacy
+`cutlass_api` kernels to execute GEMM operations.
 The runtime helpers (_nvgemm_run, _nvgemm_precompile, etc.) are imported by the
 generated wrapper at runtime, keeping the generated code thin.
 """
@@ -22,6 +23,12 @@ from torch._inductor.codegen.common import (
 )
 from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import CuteDSLOpOverrides
 from torch._inductor.codegen.cutlass.python_evt import _ACCUMULATOR_ARG_NAME
+from torch._inductor.codegen.nv_universal_gemm.cutlass_ops import (
+    get_arguments_module,
+    get_artifact_module,
+    get_provider_submodule,
+    provider_module_names,
+)
 from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_utils import (
     to_cutlass_scale_mode,
 )
@@ -74,7 +81,7 @@ def _create_gemm_arguments(
     swizzle_mode_b: Any | None = None,
     epilogue: Any | None = None,
 ):
-    import cutlass_api
+    arguments = get_arguments_module()
 
     if epilogue is not None and variant_name != "GEMM":
         raise NotImplementedError(
@@ -84,7 +91,7 @@ def _create_gemm_arguments(
     match variant_name:
         case "GROUPED_GEMM":
             a, b, offsets = input_tensors
-            return cutlass_api.arguments.GroupedGemmArguments(
+            return arguments.GroupedGemmArguments(
                 a,
                 b,
                 out,
@@ -93,12 +100,10 @@ def _create_gemm_arguments(
             )
 
         case "SCALED_GEMM":
-            from cutlass_api.arguments import ScaledTensor
-
             a, b, scale_a, scale_b = input_tensors
-            scaled_a = ScaledTensor(a, scale_a, scale_mode_a, swizzle_mode_a)
-            scaled_b = ScaledTensor(b, scale_b, scale_mode_b, swizzle_mode_b)
-            return cutlass_api.arguments.GemmArguments(
+            scaled_a = arguments.ScaledTensor(a, scale_a, scale_mode_a, swizzle_mode_a)
+            scaled_b = arguments.ScaledTensor(b, scale_b, scale_mode_b, swizzle_mode_b)
+            return arguments.GemmArguments(
                 scaled_a,
                 scaled_b,
                 out,
@@ -110,7 +115,7 @@ def _create_gemm_arguments(
             kwargs: dict[str, Any] = {"accumulator_type": accumulator_type}
             if epilogue is not None:
                 kwargs["epilogue"] = epilogue
-            return cutlass_api.arguments.GemmArguments(a, b, out, **kwargs)
+            return arguments.GemmArguments(a, b, out, **kwargs)
 
         case _:
             raise NotImplementedError(f"Unsupported NVGEMM variant: {variant_name}")
@@ -175,10 +180,9 @@ def _rewrap_efc_compiled_obj(compiled_fn, kernel):
     if not hasattr(kernel, "impl") or not hasattr(kernel.impl, "efc"):
         return compiled_fn
 
-    from cutlass_api.providers.cutedsl.gemm.sm100_static_persistent_efc import (
-        KernelOperand,
-        TensorWrapper,
-    )
+    efc_module = get_provider_submodule("cutedsl.gemm.sm100_static_persistent_efc")
+    KernelOperand = efc_module.KernelOperand
+    TensorWrapper = efc_module.TensorWrapper
 
     def wrapped_launch(a_tensor, b_tensor, stream, *supplemental_args):
         runtime_args = [
@@ -216,10 +220,9 @@ def _nvgemm_run(
     has_epilogue: bool = False,
     aux_tensors: tuple = (),
 ):
-    from cutlass_api.artifact import CompiledArtifact
-
     from torch._inductor.runtime.cutedsl_cache import disk_cache_get, disk_cache_set
 
+    CompiledArtifact = get_artifact_module().CompiledArtifact
     args = _create_gemm_arguments(
         variant_name,
         input_tensors,
@@ -271,12 +274,12 @@ def _nvgemm_run(
     )
 
 
-_MAX_ACTIVE_CLUSTERS_MODULES = [
-    "cutlass_api.providers.cutedsl.utils",
-    "cutlass_api.providers.cutedsl.gemm.sm100_static_persistent",
-    "cutlass_api.providers.cutedsl.gemm.sm100_static_persistent_efc",
-    "cutlass_api.providers.cutedsl.gemm.sm100_dense_blockscaled_static_persistent",
-    "cutlass_api.providers.cutedsl.gemm.sm100_contiguous_offset_2d3d_dense_gemm",
+_MAX_ACTIVE_CLUSTERS_MODULE_NAMES = [
+    "cutedsl.utils",
+    "cutedsl.gemm.sm100_static_persistent",
+    "cutedsl.gemm.sm100_static_persistent_efc",
+    "cutedsl.gemm.sm100_dense_blockscaled_static_persistent",
+    "cutedsl.gemm.sm100_contiguous_offset_2d3d_dense_gemm",
 ]
 
 
@@ -329,7 +332,7 @@ def _nvgemm_precompile(
     def mac_fn(*a, **kw):
         return max_active_clusters
 
-    for mod_name in _MAX_ACTIVE_CLUSTERS_MODULES:
+    for mod_name in provider_module_names(_MAX_ACTIVE_CLUSTERS_MODULE_NAMES):
         try:
             m = importlib.import_module(mod_name)
         except ImportError:
@@ -460,7 +463,7 @@ class NVUniversalGemmKernel(Kernel):
 
         # Build variant_kwargs dict expression for SCALED_GEMM
         variant_kwargs_expr = "None"
-        variant_extra_imports = ""
+        needs_library_import = False
         if self.variant.name == "SCALED_GEMM":
             sma, swza, smb, swzb = _get_scaled_gemm_modes(
                 self.scale_type_a,
@@ -468,9 +471,7 @@ class NVUniversalGemmKernel(Kernel):
                 self.scale_type_b,
                 self.swizzle_type_b,
             )
-            variant_extra_imports = (
-                "from cutlass_api.library import ScaleMode, ScaleSwizzleMode"
-            )
+            needs_library_import = True
             variant_kwargs_expr = (
                 "{"
                 f'"scale_mode_a": ScaleMode.{sma.name}, '
@@ -491,15 +492,28 @@ class NVUniversalGemmKernel(Kernel):
             code.writeline("_nvgemm_run,")
             code.writeline("_nvgemm_precompile,")
         code.writeline(")")
-        code.writeline("from torch._inductor.utils import _ensure_fp4_dtype_registered")
-        code.writeline("_ensure_fp4_dtype_registered()")
-        if variant_extra_imports:
-            code.writeline(variant_extra_imports)
+        code.writeline(
+            "from torch._inductor.codegen.nv_universal_gemm.cutlass_ops import ("
+        )
+        with code.indent():
+            code.writeline("ensure_fp4_dtype_registered,")
+            if needs_library_import:
+                code.writeline("get_library_module,")
+            if has_epilogue:
+                code.writeline("get_arguments_module,")
+        code.writeline(")")
+        code.writeline("ensure_fp4_dtype_registered()")
+        if needs_library_import:
+            code.writeline("_cutlass_library = get_library_module()")
+            code.writeline("ScaleMode = _cutlass_library.ScaleMode")
+            code.writeline("ScaleSwizzleMode = _cutlass_library.ScaleSwizzleMode")
         if has_epilogue:
-            code.writeline("from cutlass_api.arguments import EpilogueArguments")
+            code.writeline(
+                "EpilogueArguments = get_arguments_module().EpilogueArguments"
+            )
         code.writeline("")
 
-        # -- Epilogue function definition (must be module-level for cutlass_api) --
+        # -- Epilogue function definition (must be module-level for CUTLASS) --
         epilogue_fn_code = self.epilogue_fn_code
         if has_epilogue and epilogue_fn_code is not None:
             code.splice(epilogue_fn_code, strip=True)
